@@ -1,0 +1,80 @@
+#include <iostream>
+
+#include "core/logging.h"
+#include "dot_product.h"
+#include "kernels/kernel.h"
+#include "mlu_op.h"
+
+#define PAD_DOWN(x, y) (((x) / (y)) * (y))
+#define PAD_UP(x, y) (((x) / (y) + (int)((x) % (y) > 0)) * (y))
+
+__nram__ int8_t nram_buffer[MAX_NRAM_SIZE];
+
+template <typename T>
+__mlu_global__ void MLUKernelDotProduct(const T *x, const T *y, T *output,
+                                        size_t N) {
+  if (taskId == 0) {
+    __gdramset(output, 1, (T)0);  // 初始化输出为0
+  }
+  __sync_all();
+
+  const int32_t n_seg = N / taskDim + (taskId == taskDim - 1) * (N % taskDim);
+  const T *x_offset = x + N / taskDim * taskId;
+  const T *y_offset = y + N / taskDim * taskId;
+
+  int32_t num_deal =
+      PAD_DOWN(MAX_NRAM_SIZE / 2 / sizeof(T), NFU_ALIGN_SIZE / sizeof(T));
+  num_deal = num_deal <= 65536 ? num_deal : 65536;  // Limit to 65536 elements
+  T *nram_x = (T *)nram_buffer;
+  T *nram_y = (T *)(nram_buffer + MAX_NRAM_SIZE / 2);
+  T local_output = (T)0;
+
+  const int32_t repeat = n_seg / num_deal;
+  const int32_t remin = n_seg % num_deal;
+
+  for (int32_t i = 0; i < repeat; i++) {
+    __memcpy_async(nram_x, x_offset + i * num_deal, num_deal * sizeof(T),
+                   GDRAM2NRAM);
+    __memcpy_async(nram_y, y_offset + i * num_deal, num_deal * sizeof(T),
+                   GDRAM2NRAM);
+    __asm__ volatile("sync;\n\t");
+
+    __bang_mul(nram_x, nram_x, nram_y, num_deal);
+    __bang_sumpool(nram_y, nram_x, 1, 1, num_deal, 1, num_deal, num_deal, 1);
+    local_output += __load_nram(nram_y);
+  }
+
+  if (remin > 0) {
+    const int32_t remin_align = PAD_UP(remin, NFU_ALIGN_SIZE / sizeof(T));
+    __memcpy_async(nram_x, x_offset + repeat * num_deal, remin * sizeof(T),
+                   GDRAM2NRAM);
+    __memcpy_async(nram_y, y_offset + repeat * num_deal, remin * sizeof(T),
+                   GDRAM2NRAM);
+    __asm__ volatile("sync;\n\t");
+
+    __bang_mul(nram_x, nram_x, nram_y, remin_align);
+    __bang_sumpool(nram_y, nram_x, 1, 1, remin, 1, remin, remin, 1);
+    local_output += __load_nram(nram_y);
+  }
+
+  __bang_atomic_reduce_add_async(output, local_output, 1);
+}
+
+mluOpStatus_t MLUOP_WIN_API KernelDotProduct(cnrtDim3_t k_dim,
+                                             cnrtFunctionType_t k_type,
+                                             cnrtQueue_t queue,
+                                             mluOpDataType_t d_type,
+                                             const void *x, const void *y,
+                                             void *output, size_t element_num) {
+  if (d_type == MLUOP_DTYPE_FLOAT) {
+    KERNEL_CHECK(MLUKernelDotProduct<<<k_dim, k_type, queue>>>(
+        (float *)x, (float *)y, (float *)output, element_num));
+  } else if (d_type == MLUOP_DTYPE_HALF) {
+    KERNEL_CHECK(MLUKernelDotProduct<<<k_dim, k_type, queue>>>(
+        (half *)x, (half *)y, (half *)output, element_num));
+  } else {
+    LOG(ERROR) << "Unsupported data type for dot product: " << d_type;
+    return MLUOP_STATUS_BAD_PARAM;
+  }
+  return MLUOP_STATUS_SUCCESS;
+}
